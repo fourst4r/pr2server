@@ -30,6 +30,15 @@ var (
 	}
 )
 
+const noslot = -1
+
+type player struct {
+	playerInfo
+	room   string
+	course string
+	slot   int
+}
+
 func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 	tl.Println("connect:", conn.RemoteAddr())
 	defer tl.Println("disconnect:", conn.RemoteAddr())
@@ -58,8 +67,9 @@ func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 		atomic.AddInt32(&sendNum, 1)
 	}
 
-	players, playersMu := make(map[*net.TCPConn]*playerInfo), sync.RWMutex{}
-	// rooms, roomsMu := make(map[string][4]*playerInfo), sync.Mutex{}
+	players, playersMu := make(map[*net.TCPConn]*player), sync.RWMutex{}
+	rooms, roomsMu := make(map[string][4]*net.TCPConn), sync.RWMutex{}
+	conf, confMu := make(map[string][4]bool), sync.RWMutex{}
 
 	go func() {
 		for {
@@ -73,11 +83,12 @@ func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 				}
 
 				playersMu.Lock()
-				players[conn] = p
+				players[conn] = &player{playerInfo: *p, slot: noslot}
 				playersMu.Unlock()
 
 				send("loginSuccessful", p.Group, p.Name)
 				send("setRank", p.Rank)
+			case fillslot:
 			}
 		}
 	}()
@@ -91,9 +102,17 @@ func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 			tl.Fatalln(err)
 		}
 		tl.Println("<-", s)
-		p := strings.Split(s, "`")
-		p = p[2:]
-		switch p[0] {
+		// for i, c := range s {
+
+		// }
+		seg := strings.Split(s, "`")
+		seg = seg[2:]
+
+		// var command, subhash string
+		// var sendn int
+		// fmt.Sscanf(s, "%s`%d`%s", &subhash, &sendn, &command)
+
+		switch seg[0] {
 		// menu
 		case "request_login_id":
 			loginNum++
@@ -124,13 +143,100 @@ func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 				)
 			}
 			playersMu.RUnlock()
+		case "set_customize_info":
+
 		case "get_online_list":
 			playersMu.RLock()
 			for _, p := range players {
 				send("addUser", p.Name, p.Group, p.Rank, p.Hats)
 			}
 			playersMu.RUnlock()
-		case "fill_slot": // f96`5`fill_slot`6500844_3`0`1
+		case "set_right_room":
+			playersMu.Lock()
+			players[conn].room = seg[1]
+			playersMu.Unlock()
+		case "fill_slot":
+			if slot, err := strconv.Atoi(seg[2]); err == nil {
+				playersMu.Lock()
+				p := players[conn]
+				roomid := p.room + seg[1]
+
+				roomsMu.Lock()
+				p.slot = slot
+				p.course = seg[1]
+				box := rooms[roomid]
+				box[slot] = conn
+				rooms[roomid] = box
+				send("fillSlot"+seg[1], slot, p.Name, p.Rank, "me")
+				// for conn, _ := range players {
+
+				// }
+				roomsMu.Unlock()
+				playersMu.Unlock()
+			}
+		case "clear_slot":
+			playersMu.RLock()
+			p := players[conn]
+			roomid := p.room + p.course
+			course := p.course
+			slot := p.slot
+
+			roomsMu.Lock()
+			if box, ok := rooms[roomid]; ok {
+				box[slot] = nil
+				rooms[roomid] = box
+				send("clearSlot"+course, slot)
+
+				any := false
+				for i := 0; i < len(box); i++ {
+					if box[i] != nil {
+						any = true
+						break
+					}
+				}
+				if !any {
+					delete(rooms, roomid)
+					confMu.Lock()
+					delete(conf, roomid)
+					confMu.Unlock()
+				}
+			}
+			roomsMu.Unlock()
+			playersMu.RUnlock()
+		case "confirm_slot":
+			playersMu.RLock()
+			p := players[conn]
+			roomid := p.room + p.course
+			course := p.course
+			slot := p.slot
+
+			roomsMu.Lock()
+			validroom := rooms[roomid][slot] == conn
+
+			if validroom {
+				confMu.Lock()
+				box := conf[roomid]
+				box[slot] = true
+				conf[roomid] = box
+				send("confirmSlot"+course, slot)
+
+				allconfirmed := true
+				for i := 0; i < len(box); i++ {
+					if !box[i] {
+						allconfirmed = false
+						break
+					}
+				}
+				if allconfirmed {
+					delete(rooms, roomid)
+					delete(conf, roomid)
+
+					// start race
+				}
+				confMu.Unlock()
+			}
+			roomsMu.Unlock()
+			playersMu.RUnlock()
 		}
 	}
 }
@@ -152,16 +258,21 @@ func runTCP() {
 	// tunnels router
 	go func() {
 		for {
-			select {
-			case m := <-rootTunnel:
-				routerMu.RLock()
-				t, ok := router[m.addr]
-				if !ok {
-					tl.Fatalln("can't find route for", m.addr)
+			m := <-rootTunnel
+			routerMu.RLock()
+		tryagain:
+			t, ok := router[m.addr]
+			if !ok {
+				// ipv4/6 localhost hack
+				if m.addr == "[::1]" {
+					m.addr = "127.0.0.1"
+					goto tryagain
 				}
-				routerMu.RUnlock()
-				t <- m.data
+				tl.Println("can't find route for", m.addr)
+				continue
 			}
+			routerMu.RUnlock()
+			t <- m.data
 		}
 	}()
 

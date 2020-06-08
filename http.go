@@ -38,6 +38,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// net.ParseIP()
 	addr := r.RemoteAddr[:strings.LastIndex(r.RemoteAddr, ":")]
 	hl.Println("login:", addr, l.Server.ServerName, l.UserName)
 	rootTunnel <- msg{addr: addr, data: l}
