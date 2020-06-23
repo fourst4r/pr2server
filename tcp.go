@@ -2,241 +2,839 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
 	tcpAddr = ":9160"
-	delim   = 0x04
+	raceCap = 4
 )
 
 var tl = log.New(os.Stdout, "{TCP} ", 0)
 
 var (
-	loginNum          = 0
-	defaultPlayerInfo = playerInfo{
-		Name:  "Guest",
-		Group: "1",
-		Rank:  150,
+	loginNum      = 0
+	defaultPlayer = player{
+		playerInfo: playerInfo{
+			Name:  "Guest",
+			Group: "1",
+			Rank:  150,
+		},
+		speed:    "100",
+		accel:    "100",
+		jump:     "100",
+		wornHats: make([]hat, 0),
 	}
 )
 
-const noslot = -1
-
 type player struct {
 	playerInfo
-	room   string
-	course string
-	slot   int
+	tempID             int
+	speed, accel, jump string
+	room, chat         string
+	course             string
+	slot               int
+
+	wornHats []hat
 }
 
-func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
-	tl.Println("connect:", conn.RemoteAddr())
-	defer tl.Println("disconnect:", conn.RemoteAddr())
-	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+func (p *player) CustomizeInfo() string {
+	return fmt.Sprintf("%s`%s`%s`%s`%s`%s`%s`%s`%s`%s`%s`%s`%s`%s`%s",
+		p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
+		p.HatColor2, p.HeadColor2, p.BodyColor2, p.FeetColor2,
+		p.Hat, p.Head, p.Body, p.Feet,
+		p.speed, p.accel, p.jump,
+	)
+}
 
-	var sendNum int32
-	send := func(s ...interface{}) {
-		num := int(atomic.LoadInt32(&sendNum))
+func (p *player) SetCustomizeInfo(s []string) {
+	p.HatColor = s[0]
+	p.HeadColor = s[1]
+	p.BodyColor = s[2]
+	p.FeetColor = s[3]
+	p.HatColor2 = s[4]
+	p.HeadColor2 = s[5]
+	p.BodyColor2 = s[6]
+	p.FeetColor2 = s[7]
+	p.Hat = s[8]
+	p.Head = s[9]
+	p.Body = s[10]
+	p.Feet = s[11]
+	p.speed = s[12]
+	p.accel = s[13]
+	p.jump = s[14]
+}
 
-		var buf strings.Builder
-		buf.WriteString(fmt.Sprint(s[0]))
-		for i := 1; i < len(s); i++ {
-			buf.WriteRune('`')
-			buf.WriteString(fmt.Sprint(s[i]))
+func (p *player) RemoteInfo() string {
+	return strings.Join([]string{
+		strconv.Itoa(p.tempID), p.Name,
+		p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
+		p.Hat, p.Head, p.Body, p.Feet,
+		fmt.Sprint(p.HatColor2), fmt.Sprint(p.HeadColor2), fmt.Sprint(p.BodyColor2), fmt.Sprint(p.FeetColor2),
+	}, sep)
+}
+
+func (p *player) LocalInfo() string {
+	return strings.Join([]string{
+		strconv.Itoa(p.tempID),
+		p.speed, p.accel, p.jump,
+		p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
+		p.Hat, p.Head, p.Body, p.Feet,
+		fmt.Sprint(p.HatColor2), fmt.Sprint(p.HeadColor2), fmt.Sprint(p.BodyColor2), fmt.Sprint(p.FeetColor2),
+	}, sep)
+}
+
+type server struct {
+	players map[*pr2conn]*player
+	boxes   map[string][raceCap]slotinfo
+	races   map[*pr2conn]*race
+	chats   map[string]chat
+}
+
+type slotinfo struct {
+	conn      *pr2conn
+	confirmed bool
+	joined    int64
+}
+
+type race struct {
+	racers          []*pr2conn
+	looseHats       map[int]hat
+	looseHatCounter int
+	// race info that must persist after a player has left the race
+	// for the finish times.
+	// zero value is ready to use
+	stats [raceCap]struct {
+		name              string
+		drawn             bool
+		startTime         time.Time
+		finishTime        time.Duration
+		finished, quit    bool
+		gone              bool
+		objectivesReached int
+	}
+}
+
+type hat struct {
+	num           string
+	color, color2 string
+}
+
+// zero value is ready to use
+type chat struct {
+	chatters []*pr2conn
+	history  []string
+}
+
+func (r *race) id(conn *pr2conn) int {
+	for i, rconn := range r.racers {
+		if conn == rconn {
+			return i
 		}
+	}
+	return -1
+}
 
-		subHash := GetMD5Hash(PacketSubHashSalt + strconv.Itoa(num) + "`" + buf.String())[:3]
-		rw.WriteString(subHash)
-		rw.WriteRune('`')
-		rw.WriteString(strconv.Itoa(num))
-		rw.WriteRune('`')
-		rw.WriteString(buf.String())
-		rw.WriteByte(delim)
-		rw.Flush()
+func subhash(p []byte) string {
+	hasher := md5.New()
+	hasher.Write([]byte(PacketSubHashSalt))
+	hasher.Write(p)
+	return hex.EncodeToString(hasher.Sum(nil))[:3]
+}
 
-		atomic.AddInt32(&sendNum, 1)
+func setHatsStr(s *server, conn *pr2conn) string {
+	var b strings.Builder
+	meID := s.players[conn].tempID //s.races[conn].id(conn)
+	b.WriteString("setHats" + strconv.Itoa(meID))
+	b.WriteString(sep)
+	for i, h := range s.players[conn].wornHats {
+		if i != 0 {
+			b.WriteString(sep) // TODO make betr xd
+		}
+		b.WriteString(h.num)
+		b.WriteString(sep)
+		b.WriteString(h.color)
+		b.WriteString(sep)
+		b.WriteString(h.color2)
+	}
+	return b.String()
+}
+
+func finishTimesStr(s *server, conn *pr2conn) string {
+	var b strings.Builder
+	b.WriteString("finishTimes")
+
+	r, ok := s.races[conn]
+	if !ok {
+		b.WriteString(sep)
+		b.WriteString("[error: can't find race]")
+		b.WriteString(sep)
+		b.WriteString("0")
+		b.WriteString(sep)
+		// drawing
+		b.WriteString(sep)
+		// gone
+		return b.String()
+	}
+	statssorted := make([]struct {
+		name              string
+		drawn             bool
+		startTime         time.Time
+		finishTime        time.Duration
+		finished          bool
+		quit              bool
+		gone              bool
+		objectivesReached int
+	}, len(r.stats))
+	copy(statssorted, r.stats[:])
+	sort.Slice(statssorted, func(i, j int) bool {
+		if statssorted[i].finished && !statssorted[j].finished {
+			return true
+		}
+		if !statssorted[i].finished && statssorted[j].finished {
+			return false
+		}
+		return statssorted[i].finishTime < statssorted[j].finishTime
+	})
+
+	for _, st := range statssorted {
+		if len(st.name) == 0 {
+			continue
+		}
+		if st.finished || st.quit {
+			b.WriteString(sep)
+			b.WriteString(st.name)
+			b.WriteString(sep)
+			if st.finished {
+				b.WriteString(fmt.Sprint(st.finishTime.Seconds()))
+			} else if st.quit {
+				b.WriteString("forfeit")
+			}
+			b.WriteString(sep)
+			if !st.drawn {
+				b.WriteString("1")
+			}
+			b.WriteString(sep)
+			if !st.gone {
+				b.WriteString("1")
+			}
+		}
 	}
 
-	players, playersMu := make(map[*net.TCPConn]*player), sync.RWMutex{}
-	rooms, roomsMu := make(map[string][4]*net.TCPConn), sync.RWMutex{}
-	conf, confMu := make(map[string][4]bool), sync.RWMutex{}
+	return b.String()
+}
 
-	go func() {
-		for {
-			switch e := (<-tunnel).(type) {
-			case login:
-				tl.Println("received", e.UserName)
-				p, err := getPlayerInfo(e.UserName)
-				if err != nil {
-					log.Println("but err occurred:", err)
-					*p = defaultPlayerInfo
-				}
+func startRace(s *server, conn *pr2conn, boxid string) {
+	// TODO: conn is only needed for course, pass course instead
+	box := s.boxes[boxid]
+	// sort em by join time
+	boxsorted := box[:]
+	sort.Slice(boxsorted, func(i, j int) bool {
+		return boxsorted[i].joined > boxsorted[j].joined
+	})
+	// assign their tempIDs
+	for i, slot := range boxsorted {
+		if slot.conn == nil {
+			continue
+		}
+		s.players[slot.conn].tempID = i
+	}
 
-				playersMu.Lock()
-				players[conn] = &player{playerInfo: *p, slot: noslot}
-				playersMu.Unlock()
+	r := &race{
+		racers:    make([]*pr2conn, 0),
+		looseHats: make(map[int]hat),
+	}
+	for i, slot := range boxsorted {
+		if slot.conn == nil {
+			continue
+		}
 
-				send("loginSuccessful", p.Group, p.Name)
-				send("setRank", p.Rank)
-			case fillslot:
+		// init player
+		p := s.players[slot.conn]
+		p.wornHats = []hat{}
+		if p.Hat != "0" {
+			p.wornHats = append(p.wornHats, hat{
+				num:    p.Hat,
+				color:  p.HatColor,
+				color2: fmt.Sprint(p.HatColor2),
+			})
+		}
+
+		// init race stuff
+		r.stats[i].name = p.Name
+		r.racers = append(r.racers, slot.conn)
+		s.races[slot.conn] = r
+
+		slot.conn.send("forceTime", 0)
+		slot.conn.send("tournamentMode", 0)
+		slot.conn.send("startGame", strings.Split(s.players[conn].course, "_")[0])
+		slot.conn.send("createLocalCharacter", p.LocalInfo())
+		for _, slot2 := range boxsorted {
+			if slot2.conn == nil {
+				continue
 			}
+			if slot.conn != slot2.conn {
+				slot.conn.send("createRemoteCharacter", s.players[slot2.conn].RemoteInfo())
+			}
+		}
+	}
+}
+
+func handle(conn *pr2conn, svr chan func(*server)) {
+	tl.Println("connect:", conn.conn.RemoteAddr())
+	defer tl.Println("disconnect:", conn.conn.RemoteAddr())
+
+	defer func() {
+		if err := recover(); err != nil {
+			ioutil.WriteFile(fmt.Sprint(time.Now().Unix())+".txt",
+				[]byte(fmt.Sprintf("%v %s", err, string(debug.Stack()))), 0777)
+			panic(err)
 		}
 	}()
 
+	defer func() {
+		svr <- func(s *server) {
+			// clean tf up
+			p := s.players[conn]
+			// clear the slot we occupy
+			boxid := p.room + p.course
+			if box, ok := s.boxes[boxid]; ok {
+				box[p.slot] = slotinfo{}
+			}
+			// kick us from the race
+			if r, ok := s.races[conn]; ok {
+				for i, racer := range r.racers {
+					if racer == conn {
+						r.racers = append(r.racers[:i], r.racers[i+1:]...)
+						id := s.players[conn].tempID
+						r.stats[id].quit = true
+						r.stats[id].gone = true
+						// send finishTimes if race is running?
+						break
+					}
+				}
+				delete(s.races, conn)
+			}
+			// clear the chat we occupy
+			if p.chat != "none" {
+				if chat, ok := s.chats[p.chat]; ok {
+					for i, chatter := range chat.chatters {
+						if chatter == conn {
+							chat.chatters = append(chat.chatters[:i], chat.chatters[i+1:]...)
+							s.chats[p.chat] = chat
+							break
+						}
+					}
+				}
+			}
+			// delete yourself
+			delete(s.players, conn)
+		}
+	}()
+
+	svr <- func(s *server) {
+		p := s.players[conn]
+		conn.send("loginSuccessful", p.Group, p.Name)
+		conn.send("setRank", p.Rank)
+	}
+
 	for {
-		s, err := rw.ReadString(delim)
+		seg, err := conn.read()
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			tl.Fatalln(err)
+			tl.Println("read err:", err)
+			break
 		}
-		tl.Println("<-", s)
-		// for i, c := range s {
-
-		// }
-		seg := strings.Split(s, "`")
-		seg = seg[2:]
-
-		// var command, subhash string
-		// var sendn int
-		// fmt.Sscanf(s, "%s`%d`%s", &subhash, &sendn, &command)
+		tl.Println("<-", seg)
 
 		switch seg[0] {
-		// menu
-		case "request_login_id":
-			loginNum++
-			send("setLoginID", loginNum)
-
 		// lobby
 		case "ping":
-			send("ping", time.Now().Unix())
+			conn.send("ping", time.Now().Unix())
 		case "get_customize_info":
-			playersMu.RLock()
-			if p, ok := players[conn]; ok {
-				var buf strings.Builder
-				buf.WriteString("1")
-				for i := 2; i < 46; i++ {
-					buf.WriteRune(',')
-					buf.WriteString(strconv.Itoa(i))
+			svr <- func(s *server) {
+				if p, ok := s.players[conn]; ok {
+					var buf strings.Builder
+					buf.WriteString("1")
+					for i := 2; i < 46; i++ {
+						buf.WriteRune(',')
+						buf.WriteString(strconv.Itoa(i))
+					}
+					all := buf.String()
+					allhats := "1,2,3,4,5,6,7,8,9,10,11,12,13,14"
+					conn.send("setCustomizeInfo",
+						p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
+						p.Hat, p.Head, p.Body, p.Feet,
+						allhats, all, all, all,
+						p.speed, p.accel, p.jump,
+						p.Rank, 0, 0,
+						p.HatColor2, p.HeadColor2, p.BodyColor2, p.FeetColor2,
+						all, all, all, all,
+					)
 				}
-				all := buf.String()
-				allhats := "1,2,3,4,5,6,7,8,9,10,11,12,13,14"
-				send("setCustomizeInfo",
-					p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
-					p.Hat, p.Head, p.Body, p.Feet,
-					allhats, all, all, all,
-					50, 50, 50,
-					p.Rank, 0, 0,
-					p.HatColor2, p.HeadColor2, p.BodyColor2, p.FeetColor2,
-					all, all, all, all,
-				)
 			}
-			playersMu.RUnlock()
 		case "set_customize_info":
-
-		case "get_online_list":
-			playersMu.RLock()
-			for _, p := range players {
-				send("addUser", p.Name, p.Group, p.Rank, p.Hats)
+			svr <- func(s *server) {
+				s.players[conn].SetCustomizeInfo(seg[1:])
 			}
-			playersMu.RUnlock()
+		case "get_online_list":
+			svr <- func(s *server) {
+				for _, p := range s.players {
+					conn.send("addUser", p.Name, p.Group, p.Rank, p.Hats)
+				}
+			}
+		case "set_game_room":
+			svr <- func(s *server) {
+				if seg[1] != "none" {
+					tl.Println("unexpected game room:", seg)
+				}
+				if r, ok := s.races[conn]; ok {
+					meID := r.id(conn)
+					tl.Println(meID, "IS GONEEEEEEEEEE")
+					if meID != -1 {
+						r.stats[s.players[conn].tempID].gone = true
+						r.racers = append(r.racers[:meID], r.racers[meID+1:]...)
+						// setFinishTime
+						finishtime := finishTimesStr(s, conn)
+						for _, racer := range r.racers {
+							racer.send(finishtime)
+						}
+					} else {
+						tl.Println("WTFFFFF?? WHY -1?")
+					}
+					delete(s.races, conn)
+				}
+			}
 		case "set_right_room":
-			playersMu.Lock()
-			players[conn].room = seg[1]
-			playersMu.Unlock()
+			svr <- func(s *server) {
+				s.players[conn].room = seg[1]
+				room := seg[1]
+				for boxid, box := range s.boxes {
+					if strings.HasPrefix(boxid, room) {
+						course := boxid[len(room):]
+						for i, slot := range box {
+							if slot.conn == nil {
+								continue
+							}
+							p := s.players[slot.conn]
+
+							if p == nil {
+								// FUCK
+								box[i] = slotinfo{}
+								s.boxes[boxid] = box
+								continue
+							}
+
+							conn.send("fillSlot"+course, i, p.Name, p.Rank)
+							if slot.confirmed {
+								conn.send("confirmSlot"+course, i)
+							}
+						}
+					}
+				}
+			}
 		case "fill_slot":
-			if slot, err := strconv.Atoi(seg[2]); err == nil {
-				playersMu.Lock()
-				p := players[conn]
-				roomid := p.room + seg[1]
+			svr <- func(s *server) {
+				if slot, err := strconv.Atoi(seg[2]); err == nil {
 
-				roomsMu.Lock()
-				p.slot = slot
-				p.course = seg[1]
-				box := rooms[roomid]
-				box[slot] = conn
-				rooms[roomid] = box
-				send("fillSlot"+seg[1], slot, p.Name, p.Rank, "me")
-				// for conn, _ := range players {
+					me := s.players[conn]
 
-				// }
-				roomsMu.Unlock()
-				playersMu.Unlock()
+					// clear the slot we occupy, if any
+					boxid := me.room + me.course
+					if box, ok := s.boxes[boxid]; ok {
+						box[me.slot] = slotinfo{}
+					}
+
+					me.slot = slot
+					me.course = seg[1]
+					boxid = me.room + me.course
+
+					box := s.boxes[boxid]
+					// dont steal some1's spot
+					if box[slot].conn == nil {
+						box[slot] = slotinfo{conn: conn, joined: time.Now().Unix()}
+						s.boxes[boxid] = box
+
+						conn.send("fillSlot"+seg[1], slot, me.Name, me.Rank, "me")
+						for pconn, p := range s.players {
+							if me.room == p.room {
+								pconn.send("fillSlot"+seg[1], slot, me.Name, me.Rank)
+							}
+						}
+					}
+				}
 			}
 		case "clear_slot":
-			playersMu.RLock()
-			p := players[conn]
-			roomid := p.room + p.course
-			course := p.course
-			slot := p.slot
+			svr <- func(s *server) {
+				me := s.players[conn]
+				boxid := me.room + me.course
 
-			roomsMu.Lock()
-			if box, ok := rooms[roomid]; ok {
-				box[slot] = nil
-				rooms[roomid] = box
-				send("clearSlot"+course, slot)
+				if box, ok := s.boxes[boxid]; ok {
+					box[me.slot] = slotinfo{}
+					s.boxes[boxid] = box
 
-				any := false
-				for i := 0; i < len(box); i++ {
-					if box[i] != nil {
-						any = true
-						break
+					for pconn, p := range s.players {
+						if me.room == p.room {
+							pconn.send("clearSlot"+me.course, me.slot)
+						}
+					}
+
+					any := false
+					allconfirmed := true
+					for i := 0; i < len(box); i++ {
+						if box[i].conn != nil {
+							any = true
+							if !box[i].confirmed {
+								allconfirmed = false
+							}
+						}
+					}
+					if any {
+						if allconfirmed && s.races[conn] == nil {
+							startRace(s, conn, boxid)
+						}
+					} else {
+						delete(s.boxes, boxid)
 					}
 				}
-				if !any {
-					delete(rooms, roomid)
-					confMu.Lock()
-					delete(conf, roomid)
-					confMu.Unlock()
-				}
 			}
-			roomsMu.Unlock()
-			playersMu.RUnlock()
 		case "confirm_slot":
-			playersMu.RLock()
-			p := players[conn]
-			roomid := p.room + p.course
-			course := p.course
-			slot := p.slot
+			svr <- func(s *server) {
+				me := s.players[conn]
+				roomid := me.room + me.course
+				validroom := s.boxes[roomid][me.slot].conn == conn
 
-			roomsMu.Lock()
-			validroom := rooms[roomid][slot] == conn
+				if validroom {
+					box := s.boxes[roomid]
+					box[me.slot].confirmed = true
+					s.boxes[roomid] = box
 
-			if validroom {
-				confMu.Lock()
-				box := conf[roomid]
-				box[slot] = true
-				conf[roomid] = box
-				send("confirmSlot"+course, slot)
+					for pconn, p := range s.players {
+						if me.room == p.room {
+							pconn.send("confirmSlot"+me.course, me.slot)
+						}
+					}
 
-				allconfirmed := true
-				for i := 0; i < len(box); i++ {
-					if !box[i] {
-						allconfirmed = false
-						break
+					allconfirmed := true
+					for i := 0; i < len(box); i++ {
+						slot := s.boxes[roomid][i]
+						if slot.conn != nil && !slot.confirmed {
+							allconfirmed = false
+							break
+						}
+					}
+					if allconfirmed {
+						startRace(s, conn, roomid)
 					}
 				}
-				if allconfirmed {
-					delete(rooms, roomid)
-					delete(conf, roomid)
-
-					// start race
-				}
-				confMu.Unlock()
 			}
-			roomsMu.Unlock()
-			playersMu.RUnlock()
+		case "finish_drawing":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					r.stats[meID].drawn = true
+					p := s.players[conn]
+
+					tl.Println("finished drawing", conn)
+					for _, racer := range r.racers {
+						racer.send("finishDrawing", p.tempID)
+					}
+
+					alldrawn := true
+					for _, st := range r.stats {
+						if len(st.name) != 0 && !st.drawn {
+							alldrawn = false
+						}
+					}
+					if alldrawn {
+						// begin race
+						start := time.Now()
+						for i, racer := range r.racers {
+							r.stats[i].startTime = start
+
+							sethats := setHatsStr(s, racer)
+							for _, racer2 := range r.racers {
+								racer2.send(sethats)
+							}
+
+							racer.send("ping", time.Now().Unix())
+							racer.send("beginRace", "")
+						}
+
+						conn.send("finishTimes")
+						// conn.send("p", 0, 0)
+					}
+				}
+			}
+		case "finish_race":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					r.stats[meID].finished = true
+					r.stats[meID].finishTime = time.Since(r.stats[meID].startTime)
+
+					// setFinishTime
+					finishtime := finishTimesStr(s, conn)
+					for _, racer := range r.racers {
+						racer.send(finishtime)
+					}
+				}
+			}
+		case "quit_race":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					r.stats[meID].quit = true
+					r.stats[meID].finishTime = time.Since(r.stats[meID].startTime)
+
+					// setFinishTime
+					finishtime := finishTimesStr(s, conn)
+					for _, racer := range r.racers {
+						racer.send(finishtime)
+					}
+				}
+			}
+		case "grab_egg":
+		case "objective_reached":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					r.stats[s.players[conn].tempID].objectivesReached++
+				}
+			}
+		case "loose_hat":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					worn := s.players[conn].wornHats
+					var popped hat
+					popped, s.players[conn].wornHats = worn[len(worn)-1], worn[:len(worn)-1]
+
+					hatID := r.looseHatCounter
+					r.looseHats[hatID] = popped
+					r.looseHatCounter++
+
+					sethats := setHatsStr(s, conn)
+					for _, racer := range r.racers {
+						racer.send("addEffect", "Hat", strings.Join(seg[1:], sep),
+							popped.num, popped.color, popped.color2, hatID)
+
+						racer.send(sethats)
+					}
+				}
+			}
+		case "get_hat":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					hatID, err := strconv.Atoi(seg[1])
+					if err != nil {
+						tl.Panicln(hatID, "is not an int")
+					}
+					hat := r.looseHats[hatID]
+					delete(r.looseHats, hatID)
+					for _, racer := range r.racers {
+						racer.send("removeHat"+seg[1], "")
+					}
+					if hat.num == "12" {
+						// TODO: thief stuff
+					} else if hat.num == "13" {
+						// TODO: arti stuff
+					} else {
+						s.players[conn].wornHats = append(s.players[conn].wornHats, hat)
+						for _, racer := range r.racers {
+							racer.send(setHatsStr(s, conn))
+						}
+					}
+				}
+			}
+		case "p":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("p"+strconv.Itoa(meID), strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "exact_pos":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("exactPos"+strconv.Itoa(meID), strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "squash":
+			// TODO
+		case "sting":
+			// TODO
+		case "set_var":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("var"+strconv.Itoa(meID), strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "add_effect":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("addEffect", strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "zap":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					meID := s.players[conn].tempID //r.id(conn)
+					for _, racer := range r.racers {
+						racer.send("zap", meID)
+					}
+				}
+			}
+		case "hit":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("hit" + strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "activate":
+			svr <- func(s *server) {
+				if r, ok := s.races[conn]; ok {
+					for _, racer := range r.racers {
+						if racer != conn {
+							racer.send("activate", strings.Join(seg[1:], sep))
+						}
+					}
+				}
+			}
+		case "chat":
+			svr <- func(s *server) {
+				me := s.players[conn]
+
+				if strings.HasPrefix(seg[1], ",say ") {
+					msg := strings.TrimPrefix(seg[1], ",say ")
+					for pconn := range s.players {
+						if pconn == conn {
+							continue
+						}
+						if _, ok := s.races[pconn]; ok {
+							pconn.send("systemChat", "notice: "+msg)
+						} else {
+							pconn.send("message", msg)
+						}
+					}
+				} else {
+
+					if r, ok := s.races[conn]; ok {
+						// race chat
+						for _, racer := range r.racers {
+							racer.send("chat", me.Name, me.Group, seg[1])
+						}
+					} else if me.chat != "none" {
+						// TODO: lobby chat
+						chat := s.chats[me.chat]
+						if len(chat.history) == 20 {
+							chat.history = chat.history[1:]
+						}
+						chat.history = append(chat.history, strings.Join([]string{
+							"chat", me.Name, me.Group, seg[1],
+						}, sep))
+						s.chats[me.chat] = chat
+						for _, chatter := range chat.chatters {
+							chatter.send("chat", me.Name, me.Group, seg[1])
+						}
+					}
+				}
+			}
+		case "set_chat_room":
+			svr <- func(s *server) {
+				p := s.players[conn]
+
+				chat := s.chats[p.chat]
+				id := -1
+				for i, chatter := range chat.chatters {
+					if chatter == conn {
+						id = i
+					}
+				}
+				inachat := id != -1
+
+				if inachat && p.chat != "none" {
+					// leave it
+					chat.chatters = append(chat.chatters[:id], chat.chatters[id+1:]...)
+					s.chats[p.chat] = chat
+
+					if len(chat.chatters) == 0 && p.chat != "main" {
+						delete(s.chats, p.chat)
+					}
+				}
+
+				if seg[1] != "none" {
+					chat := s.chats[seg[1]]
+					chat.chatters = append(chat.chatters, conn)
+					s.chats[seg[1]] = chat
+					// send the history
+					for _, msg := range chat.history {
+						conn.send(msg)
+					}
+				}
+
+				p.chat = seg[1]
+			}
+		// if seg[1] == "main" {
+		// 	conn.send("systemChat", TODO)
+		// }
+		case "get_chat_rooms":
+			svr <- func(s *server) {
+				var b strings.Builder
+				b.WriteString("setChatRoomList")
+				if len(s.chats) > 0 {
+					for chatroom, chat := range s.chats {
+						// if chatroom == "none" {
+						// 	continue
+						// }
+						b.WriteString(sep)
+						b.WriteString(chatroom)
+						b.WriteString(" - ")
+						b.WriteString(strconv.Itoa(len(chat.chatters)))
+						b.WriteString(" players")
+					}
+				} else {
+					b.WriteString(sep)
+					b.WriteString("No one is chatting. :(")
+				}
+				conn.send(b.String())
+			}
 		}
 	}
 }
@@ -244,51 +842,134 @@ func handleConn(conn *net.TCPConn, tunnel chan interface{}) {
 func runTCP() {
 	addr, err := net.ResolveTCPAddr("tcp4", tcpAddr)
 	if err != nil {
-		tl.Fatalln(err)
+		tl.Panicln(err)
 	}
 	l, err := net.ListenTCP("tcp4", addr)
 	if err != nil {
-		tl.Fatalln(err)
+		tl.Panicln(err)
 	}
 	defer l.Close()
 
-	var routerMu sync.RWMutex
-	router := make(map[string]chan interface{})
-
-	// tunnels router
+	svr := make(chan func(*server))
 	go func() {
-		for {
-			m := <-rootTunnel
-			routerMu.RLock()
-		tryagain:
-			t, ok := router[m.addr]
-			if !ok {
-				// ipv4/6 localhost hack
-				if m.addr == "[::1]" {
-					m.addr = "127.0.0.1"
-					goto tryagain
-				}
-				tl.Println("can't find route for", m.addr)
-				continue
+		defer func() {
+			if err := recover(); err != nil {
+				ioutil.WriteFile(fmt.Sprint(time.Now().Unix())+".txt",
+					[]byte(fmt.Sprintf("%v %s", err, string(debug.Stack()))), 0777)
+				panic(err)
 			}
-			routerMu.RUnlock()
-			t <- m.data
+		}()
+		s := &server{
+			players: make(map[*pr2conn]*player),
+			boxes:   make(map[string][4]slotinfo),
+			races:   make(map[*pr2conn]*race),
+			chats:   make(map[string]chat),
+		}
+		for fn := range svr {
+			fn(s)
 		}
 	}()
 
 	tl.Println("started")
+	var loginID int32
 	for {
-		conn, err := l.AcceptTCP()
+		tcpconn, err := l.AcceptTCP()
 		if err != nil {
-			tl.Fatalln(err)
+			tl.Panicln(err)
 		}
+		conn := newpr2conn(tcpconn)
 
-		addr := trimport(conn.RemoteAddr().String())
-		routerMu.Lock()
-		t := make(chan interface{})
-		router[addr] = t
-		routerMu.Unlock()
+		// login sentry
+		go func() {
+			id := atomic.AddInt32(&loginID, 1)
+			s, err := conn.read()
+			if err != nil {
+				conn.close()
+				return
+			}
 
-		go handleConn(conn, t)
+			if s[0] != "request_login_id" {
+				tl.Printf("invalid login (%d): %s\n", id, s)
+				conn.close()
+				return
+			}
+			conn.send("setLoginID", id)
+
+			loginCh := make(chan *player)
+			loginsMu.Lock()
+			logins[int(id)] = loginCh
+			loginsMu.Unlock()
+
+			defer func() {
+				loginsMu.Lock()
+				delete(logins, int(id))
+				loginsMu.Unlock()
+			}()
+
+			// wait for login.php
+			if p, ok := <-loginCh; ok {
+				svr <- func(s *server) {
+					s.players[conn] = p
+				}
+
+				tl.Println("LOGGED IN")
+				// good to Go, player is permitted on the server
+				go handle(conn, svr)
+			}
+		}()
 	}
+}
+
+func newpr2conn(conn *net.TCPConn) *pr2conn {
+	return &pr2conn{
+		conn: conn,
+		r:    bufio.NewReader(conn),
+	}
+}
+
+const (
+	delim = ''
+	sep   = "`"
+)
+
+type pr2conn struct {
+	conn    *net.TCPConn
+	sendNum int32
+	r       *bufio.Reader
+}
+
+func (c *pr2conn) send(s ...interface{}) (int, error) {
+	n := atomic.LoadInt32(&c.sendNum)
+	s = append([]interface{}{n}, s...)
+	atomic.AddInt32(&c.sendNum, 1)
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprint(s[0]))
+	for i := 1; i < len(s); i++ {
+		buf.WriteString(sep)
+		buf.WriteString(fmt.Sprint(s[i]))
+	}
+	hash := subhash(buf.Bytes()) + sep
+	b := append([]byte(hash), buf.Bytes()...)
+
+	// tl.Println("->", string(b))
+
+	return c.conn.Write(append(b, delim))
+}
+
+// pls dont read from multiple goroutines 🙏
+func (c *pr2conn) read() ([]string, error) {
+	s, err := c.r.ReadString(delim)
+	if err != nil {
+		return nil, err
+	}
+	seg := strings.Split(strings.TrimSuffix(s, string(delim)), string(sep))
+	if len(seg) < 3 {
+		return nil, fmt.Errorf("unable to parse packet %q", s)
+	}
+	return seg[2:], nil
+}
+
+func (c *pr2conn) close() error {
+	return c.conn.Close()
 }

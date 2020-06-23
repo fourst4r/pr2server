@@ -1,0 +1,1 @@
+{"servers":[{"server_id":"1","server_name":"Alpha","address":"34.68.56.163","port":"9160","population":"33","status":"open","guild_id":"0","tournament":"0","happy_hour":0}]}
