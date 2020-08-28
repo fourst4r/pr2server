@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -38,6 +39,7 @@ var (
 		accel:    "100",
 		jump:     "100",
 		wornHats: make([]hat, 0),
+		replays:  make(map[string]string),
 	}
 )
 
@@ -50,6 +52,11 @@ type player struct {
 	slot               int
 
 	wornHats []hat
+
+	// replays []*strings.Builder
+	replaying bool
+	replayer  <-chan []string
+	replays   map[string]string
 }
 
 func (p *player) CustomizeInfo() string {
@@ -99,9 +106,9 @@ func (p *player) LocalInfo() string {
 }
 
 type server struct {
-	players map[*pr2conn]*player
+	players map[conner]*player
 	boxes   map[string][raceCap]slotinfo
-	races   map[*pr2conn]*race
+	races   map[conner]*race
 	chats   map[string]chat
 }
 
@@ -112,7 +119,7 @@ type slotinfo struct {
 }
 
 type race struct {
-	racers          []*pr2conn
+	racers          []conner
 	looseHats       map[int]hat
 	looseHatCounter int
 	// race info that must persist after a player has left the race
@@ -174,7 +181,7 @@ func setHatsStr(s *server, conn *pr2conn) string {
 	return b.String()
 }
 
-func finishTimesStr(s *server, conn *pr2conn) string {
+func finishTimesStr(s *server, conn conner) string {
 	var b strings.Builder
 	b.WriteString("finishTimes")
 
@@ -238,8 +245,8 @@ func finishTimesStr(s *server, conn *pr2conn) string {
 	return b.String()
 }
 
-func startRace(s *server, conn *pr2conn, boxid string) {
-	// TODO: conn is only needed for course, pass course instead
+func startRace(s *server, conn conner, boxid string) {
+	// TODO: conn is only needed for course, pass course instead?
 	box := s.boxes[boxid]
 	// sort em by join time
 	boxsorted := box[:]
@@ -247,21 +254,27 @@ func startRace(s *server, conn *pr2conn, boxid string) {
 		return boxsorted[i].joined > boxsorted[j].joined
 	})
 	// assign their tempIDs
+	// tempID := 0
 	for i, slot := range boxsorted {
 		if slot.conn == nil {
 			continue
 		}
-		s.players[slot.conn].tempID = i
+		s.players[slot.conn].tempID = i //tempID
+		// tempID++
 	}
 
 	r := &race{
-		racers:    make([]*pr2conn, 0),
+		racers:    make([]conner, 0),
 		looseHats: make(map[int]hat),
 	}
+	// vcr watches packets to record a replay
+	vcr := newvcr(&strings.Builder{})
+
 	for i, slot := range boxsorted {
 		if slot.conn == nil {
 			continue
 		}
+		// slot.conn.startRecording(&strings.Builder{})
 
 		// init player
 		p := s.players[slot.conn]
@@ -288,10 +301,13 @@ func startRace(s *server, conn *pr2conn, boxid string) {
 				continue
 			}
 			if slot.conn != slot2.conn {
+				vcr.send("createRemoteCharacter", s.players[slot2.conn].RemoteInfo())
 				slot.conn.send("createRemoteCharacter", s.players[slot2.conn].RemoteInfo())
 			}
 		}
 	}
+	// vcr is the last "racer"
+	r.racers = append(r.racers, vcr)
 }
 
 func handle(conn *pr2conn, svr chan func(*server)) {
@@ -377,7 +393,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 						buf.WriteString(strconv.Itoa(i))
 					}
 					all := buf.String()
-					allhats := "1,2,3,4,5,6,7,8,9,10,11,12,13,14"
+					allhats := "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"
 					conn.send("setCustomizeInfo",
 						p.HatColor, p.HeadColor, p.BodyColor, p.FeetColor,
 						p.Hat, p.Head, p.Body, p.Feet,
@@ -418,6 +434,23 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 					} else {
 						tl.Println("WTFFFFF?? WHY -1?")
 					}
+
+					if len(r.racers) == 1 {
+						// save our replay!
+						p := s.players[conn]
+						replayID := fmt.Sprintf("%s_%d", p.course, time.Now().Unix())
+						replay := r.racers[0].(*vcrconn).out.(*strings.Builder)
+						p.replays[replayID] = replay.String()
+						err := ioutil.WriteFile(replayID, []byte(replay.String()), 0666)
+						if err != nil {
+							log.Println(err)
+						}
+						conn.send("message", fmt.Sprintf("replayID: %s", replayID))
+						fmt.Println("saved replay", replayID)
+					}
+
+					// conn.stopRecording()
+
 					delete(s.races, conn)
 				}
 			}
@@ -546,10 +579,15 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 			}
 		case "finish_drawing":
 			svr <- func(s *server) {
+				p := s.players[conn]
+				if p.replaying {
+					tl.Println("go playReplay()")
+					go playReplay(svr, conn, p.replayer)
+					return
+				}
 				if r, ok := s.races[conn]; ok {
 					meID := s.players[conn].tempID //r.id(conn)
 					r.stats[meID].drawn = true
-					p := s.players[conn]
 
 					tl.Println("finished drawing", conn)
 					for _, racer := range r.racers {
@@ -568,9 +606,12 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 						for i, racer := range r.racers {
 							r.stats[i].startTime = start
 
-							sethats := setHatsStr(s, racer)
-							for _, racer2 := range r.racers {
-								racer2.send(sethats)
+							switch racer.(type) {
+							case *pr2conn:
+								sethats := setHatsStr(s, racer.(*pr2conn))
+								for _, racer2 := range r.racers {
+									racer2.send(sethats)
+								}
 							}
 
 							racer.send("ping", time.Now().Unix())
@@ -753,6 +794,19 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 							pconn.send("message", msg)
 						}
 					}
+				} else if strings.HasPrefix(seg[1], "/replay ") {
+					replayID := strings.TrimPrefix(seg[1], "/replay ")
+					spl := strings.Split(replayID, "_")
+					p := s.players[conn]
+					if replay, ok := p.replays[replayID]; ok {
+						conn.send("startReplay", spl[0], spl[1])
+						p.replaying = true
+						replayClone := make([]byte, len(replay))
+						copy(replayClone, replay)
+						p.replayer = Replay(bytes.NewBuffer(replayClone))
+					} else {
+						conn.send("systemChat", "invalid replay id")
+					}
 				} else {
 
 					if r, ok := s.races[conn]; ok {
@@ -839,6 +893,25 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 	}
 }
 
+func playReplay(svr chan func(*server), conn *pr2conn, replay <-chan []string) {
+	for {
+		args, ok := <-replay
+		tl.Println("args=", args)
+		if !ok {
+			// we're done i guess
+			break
+		}
+		svr <- func(s *server) {
+			golangbad := make([]interface{}, len(args))
+			for i, a := range args {
+				golangbad[i] = a
+			}
+			conn.send(golangbad...)
+		}
+	}
+	tl.Println("playReplay DONE!!!!!")
+}
+
 func runTCP() {
 	addr, err := net.ResolveTCPAddr("tcp4", tcpAddr)
 	if err != nil {
@@ -860,9 +933,9 @@ func runTCP() {
 			}
 		}()
 		s := &server{
-			players: make(map[*pr2conn]*player),
+			players: make(map[conner]*player),
 			boxes:   make(map[string][4]slotinfo),
-			races:   make(map[*pr2conn]*race),
+			races:   make(map[conner]*race),
 			chats:   make(map[string]chat),
 		}
 		for fn := range svr {
@@ -924,6 +997,7 @@ func newpr2conn(conn *net.TCPConn) *pr2conn {
 	return &pr2conn{
 		conn: conn,
 		r:    bufio.NewReader(conn),
+		// out:  ioutil.Discard,
 	}
 }
 
@@ -932,11 +1006,77 @@ const (
 	sep   = "`"
 )
 
+type conner interface {
+	send(s ...interface{}) (int, error)
+	read() ([]string, error)
+	close() error
+	// startRecording(w io.Writer)
+	// stopRecording()
+}
+
+var badVCR = errors.New("vcrconn should only exist in a race")
+
+func newvcr(out io.Writer) *vcrconn {
+	return &vcrconn{
+		out: out,
+	}
+}
+
+// vcrconn... it likes to watch
+type vcrconn struct {
+	out     io.Writer
+	sendNum int32
+}
+
+// func (c *vcrconn) startRecording(w io.Writer) {
+// 	c.out = w
+// }
+
+// func (c *vcrconn) stopRecording() {
+// 	c.out = ioutil.Discard
+// }
+
+func (c *vcrconn) send(s ...interface{}) (int, error) {
+	n := atomic.LoadInt32(&c.sendNum)
+	s = append([]interface{}{n}, s...)
+	atomic.AddInt32(&c.sendNum, 1)
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprint(s[0]))
+	for i := 1; i < len(s); i++ {
+		buf.WriteString(sep)
+		buf.WriteString(fmt.Sprint(s[i]))
+	}
+	hash := subhash(buf.Bytes()) + sep
+	b := append([]byte(hash), buf.Bytes()...)
+
+	// tl.Println("->", string(b))
+	unixMilli := time.Now().UnixNano() / (int64(time.Millisecond) / int64(time.Nanosecond))
+	return fmt.Fprintf(c.out, "%d`%s\n", unixMilli, b)
+}
+
+func (c *vcrconn) read() ([]string, error) {
+	return nil, badVCR
+}
+
+func (c *vcrconn) close() error {
+	return badVCR
+}
+
 type pr2conn struct {
 	conn    *net.TCPConn
 	sendNum int32
 	r       *bufio.Reader
+	// out     io.Writer
 }
+
+// func (c *pr2conn) startRecording(w io.Writer) {
+// 	c.out = w
+// }
+
+// func (c *pr2conn) stopRecording() {
+// 	c.out = ioutil.Discard
+// }
 
 func (c *pr2conn) send(s ...interface{}) (int, error) {
 	n := atomic.LoadInt32(&c.sendNum)
@@ -953,6 +1093,8 @@ func (c *pr2conn) send(s ...interface{}) (int, error) {
 	b := append([]byte(hash), buf.Bytes()...)
 
 	// tl.Println("->", string(b))
+	// unixMilli := time.Now().UnixNano() / (int64(time.Millisecond) / int64(time.Nanosecond))
+	// fmt.Fprintf(c.out, "%d`%s\n", unixMilli, b)
 
 	return c.conn.Write(append(b, delim))
 }
