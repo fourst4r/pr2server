@@ -46,6 +46,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	hl.Println("login:", l.UserName)
 	p := defaultPlayer
 	pinfo, err := getPlayerInfo(l.UserName)
+	pinfo.Hats = 15
+	pinfo.Rank = 50
 	if err == nil && pinfo.Success {
 		p.playerInfo = *pinfo
 	} else {
