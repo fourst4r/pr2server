@@ -47,5 +47,5 @@ func parsePkt(pkt string) (t time.Time, args []string, err error) {
 	if err != nil {
 		return
 	}
-	return time.Unix(0, int64(nano)*1e6), spl[2:], nil
+	return time.Unix(0, int64(nano)*1e6), spl[3:], nil
 }

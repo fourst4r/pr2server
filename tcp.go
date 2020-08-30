@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -245,8 +243,7 @@ func finishTimesStr(s *server, conn conner) string {
 	return b.String()
 }
 
-func startRace(s *server, conn conner, boxid string) {
-	// TODO: conn is only needed for course, pass course instead?
+func startRace(s *server, course string, boxid string) {
 	box := s.boxes[boxid]
 	// sort em by join time
 	boxsorted := box[:]
@@ -254,13 +251,11 @@ func startRace(s *server, conn conner, boxid string) {
 		return boxsorted[i].joined > boxsorted[j].joined
 	})
 	// assign their tempIDs
-	// tempID := 0
 	for i, slot := range boxsorted {
 		if slot.conn == nil {
 			continue
 		}
-		s.players[slot.conn].tempID = i //tempID
-		// tempID++
+		s.players[slot.conn].tempID = i
 	}
 
 	r := &race{
@@ -274,7 +269,6 @@ func startRace(s *server, conn conner, boxid string) {
 		if slot.conn == nil {
 			continue
 		}
-		// slot.conn.startRecording(&strings.Builder{})
 
 		// init player
 		p := s.players[slot.conn]
@@ -294,19 +288,21 @@ func startRace(s *server, conn conner, boxid string) {
 
 		slot.conn.send("forceTime", 0)
 		slot.conn.send("tournamentMode", 0)
-		slot.conn.send("startGame", strings.Split(s.players[conn].course, "_")[0])
+		slot.conn.send("startGame", strings.Split(course, "_")[0])
 		slot.conn.send("createLocalCharacter", p.LocalInfo())
 		for _, slot2 := range boxsorted {
 			if slot2.conn == nil {
 				continue
 			}
 			if slot.conn != slot2.conn {
-				vcr.send("createRemoteCharacter", s.players[slot2.conn].RemoteInfo())
 				slot.conn.send("createRemoteCharacter", s.players[slot2.conn].RemoteInfo())
 			}
 		}
 	}
 	// vcr is the last "racer"
+	for _, racer := range r.racers {
+		vcr.send("createRemoteCharacter", s.players[racer].RemoteInfo())
+	}
 	r.racers = append(r.racers, vcr)
 }
 
@@ -420,6 +416,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 				if seg[1] != "none" {
 					tl.Println("unexpected game room:", seg)
 				}
+				s.players[conn].replaying = false
 				if r, ok := s.races[conn]; ok {
 					meID := r.id(conn)
 					tl.Println(meID, "IS GONEEEEEEEEEE")
@@ -446,10 +443,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 							log.Println(err)
 						}
 						conn.send("message", fmt.Sprintf("replayID: %s", replayID))
-						fmt.Println("saved replay", replayID)
 					}
-
-					// conn.stopRecording()
 
 					delete(s.races, conn)
 				}
@@ -540,7 +534,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 					}
 					if any {
 						if allconfirmed && s.races[conn] == nil {
-							startRace(s, conn, boxid)
+							startRace(s, s.players[conn].course, boxid)
 						}
 					} else {
 						delete(s.boxes, boxid)
@@ -573,7 +567,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 						}
 					}
 					if allconfirmed {
-						startRace(s, conn, roomid)
+						startRace(s, s.players[conn].course, roomid)
 					}
 				}
 			}
@@ -581,7 +575,7 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 			svr <- func(s *server) {
 				p := s.players[conn]
 				if p.replaying {
-					tl.Println("go playReplay()")
+					conn.send("createSpectator", "")
 					go playReplay(svr, conn, p.replayer)
 					return
 				}
@@ -896,7 +890,6 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 func playReplay(svr chan func(*server), conn *pr2conn, replay <-chan []string) {
 	for {
 		args, ok := <-replay
-		tl.Println("args=", args)
 		if !ok {
 			// we're done i guess
 			break
@@ -909,7 +902,6 @@ func playReplay(svr chan func(*server), conn *pr2conn, replay <-chan []string) {
 			conn.send(golangbad...)
 		}
 	}
-	tl.Println("playReplay DONE!!!!!")
 }
 
 func runTCP() {
@@ -991,127 +983,4 @@ func runTCP() {
 			}
 		}()
 	}
-}
-
-func newpr2conn(conn *net.TCPConn) *pr2conn {
-	return &pr2conn{
-		conn: conn,
-		r:    bufio.NewReader(conn),
-		// out:  ioutil.Discard,
-	}
-}
-
-const (
-	delim = ''
-	sep   = "`"
-)
-
-type conner interface {
-	send(s ...interface{}) (int, error)
-	read() ([]string, error)
-	close() error
-	// startRecording(w io.Writer)
-	// stopRecording()
-}
-
-var badVCR = errors.New("vcrconn should only exist in a race")
-
-func newvcr(out io.Writer) *vcrconn {
-	return &vcrconn{
-		out: out,
-	}
-}
-
-// vcrconn... it likes to watch
-type vcrconn struct {
-	out     io.Writer
-	sendNum int32
-}
-
-// func (c *vcrconn) startRecording(w io.Writer) {
-// 	c.out = w
-// }
-
-// func (c *vcrconn) stopRecording() {
-// 	c.out = ioutil.Discard
-// }
-
-func (c *vcrconn) send(s ...interface{}) (int, error) {
-	n := atomic.LoadInt32(&c.sendNum)
-	s = append([]interface{}{n}, s...)
-	atomic.AddInt32(&c.sendNum, 1)
-
-	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprint(s[0]))
-	for i := 1; i < len(s); i++ {
-		buf.WriteString(sep)
-		buf.WriteString(fmt.Sprint(s[i]))
-	}
-	hash := subhash(buf.Bytes()) + sep
-	b := append([]byte(hash), buf.Bytes()...)
-
-	// tl.Println("->", string(b))
-	unixMilli := time.Now().UnixNano() / (int64(time.Millisecond) / int64(time.Nanosecond))
-	return fmt.Fprintf(c.out, "%d`%s\n", unixMilli, b)
-}
-
-func (c *vcrconn) read() ([]string, error) {
-	return nil, badVCR
-}
-
-func (c *vcrconn) close() error {
-	return badVCR
-}
-
-type pr2conn struct {
-	conn    *net.TCPConn
-	sendNum int32
-	r       *bufio.Reader
-	// out     io.Writer
-}
-
-// func (c *pr2conn) startRecording(w io.Writer) {
-// 	c.out = w
-// }
-
-// func (c *pr2conn) stopRecording() {
-// 	c.out = ioutil.Discard
-// }
-
-func (c *pr2conn) send(s ...interface{}) (int, error) {
-	n := atomic.LoadInt32(&c.sendNum)
-	s = append([]interface{}{n}, s...)
-	atomic.AddInt32(&c.sendNum, 1)
-
-	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprint(s[0]))
-	for i := 1; i < len(s); i++ {
-		buf.WriteString(sep)
-		buf.WriteString(fmt.Sprint(s[i]))
-	}
-	hash := subhash(buf.Bytes()) + sep
-	b := append([]byte(hash), buf.Bytes()...)
-
-	// tl.Println("->", string(b))
-	// unixMilli := time.Now().UnixNano() / (int64(time.Millisecond) / int64(time.Nanosecond))
-	// fmt.Fprintf(c.out, "%d`%s\n", unixMilli, b)
-
-	return c.conn.Write(append(b, delim))
-}
-
-// pls dont read from multiple goroutines 🙏
-func (c *pr2conn) read() ([]string, error) {
-	s, err := c.r.ReadString(delim)
-	if err != nil {
-		return nil, err
-	}
-	seg := strings.Split(strings.TrimSuffix(s, string(delim)), string(sep))
-	if len(seg) < 3 {
-		return nil, fmt.Errorf("unable to parse packet %q", s)
-	}
-	return seg[2:], nil
-}
-
-func (c *pr2conn) close() error {
-	return c.conn.Close()
 }
