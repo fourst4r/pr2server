@@ -438,10 +438,10 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 						replayID := fmt.Sprintf("%s_%d", p.course, time.Now().Unix())
 						replay := r.racers[0].(*vcrconn).out.(*strings.Builder)
 						p.replays[replayID] = replay.String()
-						err := ioutil.WriteFile(replayID, []byte(replay.String()), 0666)
-						if err != nil {
-							log.Println(err)
-						}
+						// err := ioutil.WriteFile(replayID, []byte(replay.String()), 0666)
+						// if err != nil {
+						// 	log.Println(err)
+						// }
 						conn.send("message", fmt.Sprintf("replayID: %s", replayID))
 					}
 

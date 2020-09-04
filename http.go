@@ -65,7 +65,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	t <- &p
 	close(t)
 
-	w.Write([]byte(`{"success":true,"token":"813531-b6c8b446b427d6bb42462e48722e26","email":false,"ant":false,"time":1591549666,"lastRead":"25354696","lastRecv":"25354696","guild":"0","guildOwner":0,"guildName":"","emblem":"","userId":813531}`))
+	w.Write([]byte(`{"success":true,"token":"813531-b6c8b446b427d6bb42462e48722e26","email":false,"ant":false,"time":1591549666,"lastRead":"25354696","lastRecv":"25354696","guild":"0","guildOwner":0,"guildName":"","emblem":"","userId":813531,"favoriteLevels":[]}`))
 }
 
 func crossdomainHandler(w http.ResponseWriter, r *http.Request) {
