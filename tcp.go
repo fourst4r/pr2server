@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -410,6 +411,22 @@ func handle(conn *pr2conn, svr chan func(*server)) {
 				for _, p := range s.players {
 					conn.send("addUser", p.Name, p.Group, p.Rank, p.Hats)
 				}
+			}
+		case "get_player_info":
+			svr <- func(s *server) {
+				for _, p := range s.players {
+					if seg[1] == p.Name {
+						var sb strings.Builder
+						err := json.NewEncoder(&sb).Encode(p.playerInfo)
+						if err != nil {
+							tl.Println(err)
+							return
+						}
+						conn.send("playerInfo", sb.String())
+						return
+					}
+				}
+				conn.send("playerInfo", "0")
 			}
 		case "set_game_room":
 			svr <- func(s *server) {

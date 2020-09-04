@@ -26,7 +26,7 @@ type login struct {
 }
 
 type playerInfo struct {
-	Success      bool        `json:"success"`
+	Success      bool        `json:"success,omitempty"`
 	Rank         int         `json:"rank"`
 	Hats         int         `json:"hats"`
 	Group        string      `json:"group"`
@@ -51,6 +51,8 @@ type playerInfo struct {
 	HeadColor2   interface{} `json:"headColor2"`
 	BodyColor2   interface{} `json:"bodyColor2"`
 	FeetColor2   interface{} `json:"feetColor2"`
+	ExpPoints    string      `json:"exp_points"`
+	ExpToRank    int         `json:"exp_to_rank"`
 }
 
 func getPlayerInfo(name string) (*playerInfo, error) {
